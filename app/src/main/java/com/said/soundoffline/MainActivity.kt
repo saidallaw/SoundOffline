@@ -416,13 +416,28 @@ private fun SuggestionsTab(vm: MainViewModel) {
                 OutlinedTextField(
                     value = vm.query,
                     onValueChange = { vm.query = it },
-                    placeholder = { Text("دوّر على كتاب أو موضوع…") },
+                    placeholder = { Text(if (vm.searchSource == 1) "دوّر في ساوند كلاود…" else "دوّر في يوتيوب…") },
                     leadingIcon = { Icon(Icons.Default.Search, null) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                     keyboardActions = KeyboardActions(onSearch = { vm.search(vm.query) }),
                 )
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("يوتيوب", "ساوند كلاود").forEachIndexed { i, label ->
+                        FilterChip(
+                            selected = vm.searchSource == i,
+                            onClick = {
+                                if (vm.searchSource != i) {
+                                    vm.searchSource = i
+                                    if (vm.query.isNotBlank()) vm.search(vm.query)
+                                }
+                            },
+                            label = { Text(label) },
+                        )
+                    }
+                }
                 Spacer(Modifier.height(6.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     QUICK_SEARCHES.forEach { q ->

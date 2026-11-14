@@ -7,6 +7,9 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+class ScException(msg: String) : IOException(msg)
+class HttpError(val code: Int) : IOException("HTTP $code")
+
 object Http {
     const val DESKTOP_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
@@ -74,6 +77,70 @@ object Http {
                 if (full) { total = pos }          // server ignored Range and sent everything
                 if (data.isEmpty()) break
                 if (total > 0) onProgress((pos.toFloat() / total).coerceAtMost(1f))
+            }
+        }
+        out.delete()
+        if (!tmp.renameTo(out)) throw ScException("فشل حفظ الملف")
+        return out
+    }
+
+    private fun fetchBytes(url: String, ua: String): ByteArray {
+        var last: IOException? = null
+        repeat(3) {
+            try {
+                return client.newCall(Request.Builder().url(url).header("User-Agent", ua).build())
+                    .execute().use { r ->
+                        if (!r.isSuccessful) throw HttpError(r.code)
+                        r.body?.bytes() ?: ByteArray(0)
+                    }
+            } catch (e: IOException) {
+                last = e
+            }
+        }
+        throw last ?: IOException("download failed")
+    }
+
+    /** Downloads every HLS segment and joins them into one file. Returns the saved file. */
+    fun downloadHls(
+        url: String, dir: File, baseName: String, suffix: String?, ua: String, onProgress: (Float) -> Unit,
+    ): File {
+        val base = url.toHttpUrlOrNull() ?: throw ScException("رابط الصوت مش صحيح")
+        var text = String(fetchBytes(url, ua))
+        // Master playlist -> pick the first variant
+        if ("#EXT-X-STREAM-INF" in text) {
+            val variant = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("#") }
+                ?: throw ScException("ملف التشغيل فاضي")
+            return downloadHls(base.resolve(variant)?.toString() ?: variant, dir, baseName, suffix, ua, onProgress)
+        }
+        var initUri: String? = null
+        val segments = mutableListOf<String>()
+        for (raw in text.lineSequence()) {
+            val line = raw.trim()
+            if (line.startsWith("#EXT-X-MAP")) {
+                initUri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1)
+            } else if (line.isNotEmpty() && !line.startsWith("#")) {
+                segments += line
+            }
+        }
+        if (segments.isEmpty()) throw ScException("ملف التشغيل فاضي")
+        fun abs(u: String) = base.resolve(u)?.toString() ?: u
+        val firstPath = segments[0].substringBefore('?').lowercase()
+        val ext = when {
+            initUri != null -> "mp4" // fragmented MP4 -> remuxed afterwards so seeking works
+            firstPath.endsWith(".mp3") -> "mp3"
+            firstPath.endsWith(".ts") -> "ts"
+            firstPath.endsWith(".aac") -> "aac"
+            firstPath.endsWith(".opus") || firstPath.endsWith(".ogg") -> "opus"
+            !suffix.isNullOrBlank() -> suffix
+            else -> "audio"
+        }
+        val out = File(dir, "$baseName.$ext")
+        val tmp = File(out.path + ".part")
+        tmp.outputStream().buffered().use { os ->
+            initUri?.let { os.write(fetchBytes(abs(it), ua)) }
+            segments.forEachIndexed { i, seg ->
+                os.write(fetchBytes(abs(seg), ua))
+                onProgress((i + 1f) / segments.size)
             }
         }
         out.delete()

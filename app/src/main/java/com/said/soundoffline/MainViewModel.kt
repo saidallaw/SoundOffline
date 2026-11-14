@@ -48,7 +48,6 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences("soundoffline", 0)
     private val library = Library(app)
-    private val sc = SoundCloudClient(prefs)
 
     // ---------- library ----------
     var tracks by mutableStateOf(library.load())
@@ -77,6 +76,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         private set
     var searchError by mutableStateOf<String?>(null)
         private set
+    /** 0 = YouTube, 1 = SoundCloud */
+    var searchSource by mutableIntStateOf(0)
 
     // ---------- player ----------
     var speed by mutableFloatStateOf(prefs.getFloat("speed", 1f))
@@ -367,7 +368,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         progress.value = null
         try {
             val list = withContext(Dispatchers.IO) {
-                if (YouTubeClient.isYouTube(text)) YouTubeClient.resolve(text) else sc.resolve(text)
+                Media.resolve(text)
             }
             var ok = 0
             var lastError: String? = null
@@ -472,7 +473,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         searchError = null
         viewModelScope.launch {
             try {
-                results = withContext(Dispatchers.IO) { YouTubeClient.search(text) }
+                val sc = searchSource == 1
+                results = withContext(Dispatchers.IO) { Media.search(text, sc) }
                 if (results.isEmpty()) searchError = "مفيش نتايج"
             } catch (e: Exception) {
                 searchError = friendly(e)
@@ -487,8 +489,8 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         is HttpError -> if (e.code == 403) "السيرفر رفض الطلب (403) — جرب تاني" else "خطأ من السيرفر (${e.code})"
         is UnknownHostException -> "مفيش اتصال بالإنترنت"
         is ReCaptchaException -> "يوتيوب طالب تحقق (كابتشا) — جرب بعد شوية"
-        is ContentNotAvailableException -> "الفيديو مش متاح (خاص أو محذوف أو مقيّد بالسن)"
-        is ExtractionException -> "مشكلة في قراءة يوتيوب — غالبًا محتاج تحديث NewPipeExtractor"
+        is ContentNotAvailableException -> "المقطع مش متاح (خاص أو محذوف أو مقيّد)"
+        is ExtractionException -> "مشكلة في قراءة المصدر — غالبًا محتاج تحديث NewPipeExtractor"
         is IllegalArgumentException -> "الرابط مش صحيح"
         else -> e.message ?: e.toString()
     }

@@ -1,5 +1,6 @@
 package com.said.soundoffline
 
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.Image
@@ -47,8 +48,10 @@ private class NpDownloader : Downloader() {
     }
 }
 
-object YouTubeClient {
+/** YouTube + SoundCloud via NewPipeExtractor: resolve links, download audio, search. */
+object Media {
     private val yt: StreamingService get() = ServiceList.YouTube
+    private val sc: StreamingService get() = ServiceList.SoundCloud
 
     @Volatile
     private var initialized = false
@@ -63,51 +66,75 @@ object YouTubeClient {
         }
     }
 
-    fun isYouTube(text: String): Boolean {
-        val url = Regex("https?://\\S+").find(text)?.value ?: return false
-        val host = url.toHttpUrlOrNull()?.host ?: return false
-        return host.endsWith("youtube.com") || host == "youtu.be" || host.endsWith("youtube-nocookie.com")
+    private fun isSoundCloud(s: StreamingService) = s.serviceId == sc.serviceId
+    private fun sourceName(s: StreamingService) = if (isSoundCloud(s)) "soundcloud" else "youtube"
+    private fun prefix(s: StreamingService) = if (isSoundCloud(s)) "sc:" else "yt:"
+
+    private fun serviceFor(url: String): StreamingService? {
+        val host = url.toHttpUrlOrNull()?.host ?: return null
+        return when {
+            host.endsWith("youtube.com") || host == "youtu.be" || host.endsWith("youtube-nocookie.com") -> yt
+            host.endsWith("soundcloud.com") || host == "snd.sc" || host.endsWith("goo.gl") -> sc
+            else -> null
+        }
     }
 
-    fun keyFor(url: String): String? = try {
-        ensureInit(); "yt:" + yt.streamLHFactory.getId(url)
+    private fun keyFor(s: StreamingService, url: String): String? = try {
+        prefix(s) + s.streamLHFactory.getId(url)
     } catch (e: Exception) {
         null
     }
 
+    /** SoundCloud share links (on.soundcloud.com/…) redirect to the real page; tracking params removed. */
+    private fun cleanSoundCloudUrl(url: String): String {
+        var u = url
+        val host = u.toHttpUrl().host
+        if (host == "on.soundcloud.com" || host.endsWith("goo.gl") || host == "snd.sc") {
+            u = Http.client.newCall(
+                okhttp3.Request.Builder().url(u).header("User-Agent", Http.DESKTOP_UA).build()
+            ).execute().use { it.request.url.toString() }
+        }
+        val parsed = u.toHttpUrl()
+        val cleanHost = parsed.host.removePrefix("m.").removePrefix("www.")
+        return parsed.newBuilder().host(cleanHost).query(null).fragment(null).build().toString()
+    }
+
     fun resolve(text: String): List<Pending> {
         ensureInit()
-        val url = Regex("https?://\\S+").find(text)?.value ?: throw ScException("مفيش رابط في النص ده")
-        return when (yt.getLinkTypeByUrl(url)) {
+        var url = Regex("https?://\\S+").find(text)?.value?.trimEnd('.', ',', ')', '"', '\'')
+            ?: throw ScException("مفيش رابط في النص ده")
+        val service = serviceFor(url) ?: throw ScException("الرابط لازم يكون من يوتيوب أو ساوند كلاود")
+        if (isSoundCloud(service)) url = cleanSoundCloudUrl(url)
+        return when (service.getLinkTypeByUrl(url)) {
             StreamingService.LinkType.STREAM -> {
-                val info = StreamInfo.getInfo(yt, url)
-                listOf(pendingFromInfo(info))
+                val info = StreamInfo.getInfo(service, url)
+                listOf(pendingFromInfo(service, info))
             }
-            StreamingService.LinkType.PLAYLIST -> playlist(url)
-            else -> throw ScException("الرابط لازم يكون فيديو أو قائمة تشغيل")
+            StreamingService.LinkType.PLAYLIST -> playlist(service, url)
+            else -> throw ScException("الرابط لازم يكون لمقطع/فيديو أو قائمة تشغيل")
         }
     }
 
-    private fun pendingFromInfo(info: StreamInfo) = Pending(
-        key = "yt:" + info.id,
+    private fun pendingFromInfo(s: StreamingService, info: StreamInfo) = Pending(
+        key = prefix(s) + info.id,
         title = info.name,
         artist = info.uploaderName ?: "",
         durationMs = info.duration * 1000,
         thumbUrl = bestThumb(info.thumbnails),
-        source = "youtube",
+        source = sourceName(s),
         sourceUrl = info.url,
         collection = null,
         order = 0,
-        fetch = { dir, p -> fetch(info, dir, p) },
+        fetch = { dir, p -> fetch(s, info, dir, p) },
     )
 
-    private fun playlist(url: String): List<Pending> {
-        val info = PlaylistInfo.getInfo(yt, url)
+    private fun playlist(s: StreamingService, url: String): List<Pending> {
+        val info = PlaylistInfo.getInfo(s, url)
         val items = ArrayList<StreamInfoItem>(info.relatedItems)
         var page = info.nextPage
         var guard = 0
         while (page != null && guard++ < 40) {
-            val more = PlaylistInfo.getMoreItems(yt, url, page)
+            val more = PlaylistInfo.getMoreItems(s, url, page)
             items += more.items
             page = if (more.hasNextPage()) more.nextPage else null
         }
@@ -115,26 +142,32 @@ object YouTubeClient {
         val name = info.name
         return items.mapIndexed { i, item ->
             Pending(
-                key = keyFor(item.url) ?: ("yt:" + item.url),
+                key = keyFor(s, item.url) ?: (prefix(s) + item.url),
                 title = item.name,
                 artist = item.uploaderName ?: "",
                 durationMs = item.duration.coerceAtLeast(0) * 1000,
                 thumbUrl = bestThumb(item.thumbnails),
-                source = "youtube",
+                source = sourceName(s),
                 sourceUrl = item.url,
                 collection = name,
                 order = i,
-                fetch = { dir, p -> fetch(StreamInfo.getInfo(yt, item.url), dir, p) },
+                fetch = { dir, p -> fetch(s, StreamInfo.getInfo(s, item.url), dir, p) },
             )
         }
     }
 
-    private fun fetch(info: StreamInfo, dir: File, onProgress: (Float) -> Unit): Fetched {
-        val audio = pickAudio(info.audioStreams) ?: throw ScException("مفيش صوت متاح للفيديو ده")
-        val ext = audio.format?.suffix?.ifBlank { null } ?: "audio"
+    private fun fetch(s: StreamingService, info: StreamInfo, dir: File, onProgress: (Float) -> Unit): Fetched {
+        val audio = pickAudio(info.audioStreams) ?: throw ScException("مفيش صوت متاح للمقطع ده")
         dir.mkdirs()
         val url = audio.content
-        val file = Http.downloadRanged(url, File(dir, "yt_${info.id}.$ext"), Http.youtubeUa(url), onProgress)
+        val base = (if (isSoundCloud(s)) "sc_" else "yt_") + info.id.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        val ua = if (isSoundCloud(s)) Http.DESKTOP_UA else Http.youtubeUa(url)
+        val file = if (audio.deliveryMethod == DeliveryMethod.HLS) {
+            Http.downloadHls(url, dir, base, audio.format?.suffix, ua, onProgress)
+        } else {
+            val ext = audio.format?.suffix?.ifBlank { null } ?: "audio"
+            Http.downloadRanged(url, File(dir, "$base.$ext"), ua, onProgress)
+        }
         return Fetched(
             file = file,
             chapters = info.streamSegments.map { Chapter(it.title, it.startTimeSeconds * 1000L) },
@@ -144,21 +177,31 @@ object YouTubeClient {
         )
     }
 
-    /** Original-language audio, progressive HTTP, M4A preferred, highest bitrate. */
+    private val FORMAT_ORDER = listOf(MediaFormat.M4A, MediaFormat.MP3, MediaFormat.WEBMA, MediaFormat.OPUS)
+
+    private fun formatRank(s: AudioStream): Int =
+        FORMAT_ORDER.indexOf(s.format).let { if (it < 0) FORMAT_ORDER.size else it }
+
+    /** Original-language audio; direct download preferred over HLS; M4A/MP3 preferred; highest bitrate. */
     private fun pickAudio(streams: List<AudioStream>): AudioStream? {
-        val progressive = streams.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
-        if (progressive.isEmpty()) return null
-        val original = progressive.filter {
+        val usable = streams.filter {
+            it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP || it.deliveryMethod == DeliveryMethod.HLS
+        }
+        if (usable.isEmpty()) return null
+        val original = usable.filter {
             it.audioTrackType == null || it.audioTrackType == AudioTrackType.ORIGINAL
-        }.ifEmpty { progressive }
-        val m4a = original.filter { it.format == MediaFormat.M4A }
-        return (m4a.ifEmpty { original }).maxByOrNull { it.averageBitrate }
+        }.ifEmpty { usable }
+        val progressive = original.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+        val pool = progressive.ifEmpty { original }
+        return pool.sortedWith(compareBy<AudioStream> { formatRank(it) }.thenByDescending { it.averageBitrate })
+            .firstOrNull()
     }
 
-    fun search(query: String): List<Suggestion> {
+    fun search(query: String, soundCloud: Boolean): List<Suggestion> {
         ensureInit()
-        val qh = yt.searchQHFactory.fromQuery(query, emptyList(), "")
-        return SearchInfo.getInfo(yt, qh).relatedItems.mapNotNull(::toSuggestion).distinctBy { it.url }
+        val s = if (soundCloud) sc else yt
+        val qh = s.searchQHFactory.fromQuery(query, emptyList(), "")
+        return SearchInfo.getInfo(s, qh).relatedItems.mapNotNull(::toSuggestion).distinctBy { it.url }
     }
 
     private fun toSuggestion(item: InfoItem): Suggestion? = when (item) {
@@ -170,7 +213,7 @@ object YouTubeClient {
                 artist = item.uploaderName ?: "",
                 durationMs = item.duration.coerceAtLeast(0) * 1000,
                 thumbUrl = bestThumb(item.thumbnails),
-                key = keyFor(item.url),
+                key = serviceFor(item.url)?.let { keyFor(it, item.url) },
             )
         }
         is PlaylistInfoItem -> Suggestion(
