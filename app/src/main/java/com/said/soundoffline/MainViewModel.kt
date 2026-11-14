@@ -268,6 +268,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         position = ms
     }
 
+    @JvmName("applySpeed")
     fun setSpeed(s: Float) {
         speed = s
         prefs.edit().putFloat("speed", s).apply()
