@@ -151,6 +151,35 @@ class SoundCloudClient(private val prefs: SharedPreferences) {
         )
     }
 
+    private fun playlistTracks(pl: JSONObject): List<ScTrack> {
+        val arr = pl.optJSONArray("tracks") ?: JSONArray()
+        val full = LinkedHashMap<Long, JSONObject?>()
+        for (i in 0 until arr.length()) {
+            val t = arr.getJSONObject(i)
+            full[t.getLong("id")] = if (t.has("media")) t else null
+        }
+        // Long playlists only return ids for most tracks; fetch the rest in batches.
+        val missing = full.filterValues { it == null }.keys.toList()
+        for (chunk in missing.chunked(50)) {
+            val res = JSONArray(api("/tracks?ids=" + chunk.joinToString(",")))
+            for (i in 0 until res.length()) {
+                val t = res.getJSONObject(i)
+                full[t.getLong("id")] = t
+            }
+        }
+        val tracks = full.values.filterNotNull().map(::toTrack)
+        if (tracks.isEmpty()) throw ScException("البلاي ليست فاضية")
+        return tracks
+    }
+
+    private fun toTrack(o: JSONObject) = ScTrack(
+        id = o.getLong("id"),
+        title = o.optString("title").ifBlank { "بدون عنوان" },
+        artist = o.optJSONObject("user")?.optString("username") ?: "",
+        durationMs = o.optLong("full_duration", o.optLong("duration")),
+        json = o,
+    )
+
     /** Downloads the track into [dir] and returns the saved file. */
     private fun download(t: ScTrack, dir: File, onProgress: (Float) -> Unit): File {
         val arr = t.json.optJSONObject("media")?.optJSONArray("transcodings")
